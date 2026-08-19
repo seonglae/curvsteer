@@ -25,22 +25,11 @@ from .edits import (bias_edit, curvature_only, m_star, random_rank1, rank_trunc)
 from .metrics import Metrics
 from .model import load as load_model
 from .site import Factors
+from .tokenizer import load_tokenizer
 from .solve import off_target, solve_alpha
 
 RANKS = (1, 2, 4, 8)
 COSTS = (0.05, 0.10, 0.20, 0.50)
-
-
-def _tokenizer(cfg):
-    try:
-        from gemma import gm
-        return gm.text.Tokenizer.from_name(cfg.model.split("/")[-1])
-    except Exception:
-        from transformers import AutoTokenizer
-        tk = AutoTokenizer.from_pretrained(cfg.model)
-        if not hasattr(tk, "bos_id"):
-            tk.bos_id = tk.bos_token_id
-        return tk
 
 
 def run_sweep(a) -> int:
@@ -49,7 +38,7 @@ def run_sweep(a) -> int:
     P = lambda n: os.path.join(a.out_dir, f"{a.config}_{n}")
 
     model = load_model(cfg.model, cfg.block, cfg.dtype)
-    tk = _tokenizer(cfg)
+    tk = load_tokenizer(cfg.model)
     met = Metrics(model, tk, cont_len=a.cont_len)
     d = model.d_model
     print(f"{cfg.model} d_model={d}, {model.n_layers} layers, "
@@ -171,13 +160,13 @@ def run_layer_scan(a) -> int:
     cfg = CONFIGS[a.config]
     os.makedirs(a.out_dir, exist_ok=True)
     model = load_model(cfg.model, cfg.block, cfg.dtype)
-    tk = _tokenizer(cfg)
+    tk = load_tokenizer(cfg.model)
     met = Metrics(model, tk)
     pos, neg, fit_idx, _ = imdb_pairs(getattr(a, "n_pairs", 64))
 
     rows = []
     for blk in range(model.n_layers):
-        model.block = blk
+        model.set_block(blk)
         fac = Factors()
         for i in fit_idx[:16]:
             ids_p, keep_p = met.encode([pos[i]])

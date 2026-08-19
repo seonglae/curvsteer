@@ -54,18 +54,45 @@ class Loaded:
     head: callable
     name: str = ""
     specs: list = field(default_factory=list)
+    _jit: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        # Compiled once per (shape, edit-arity). Without this the 48 layers run
+        # as several thousand separate dispatches per batch and the sweep does
+        # not finish. `alpha` is traced, not static, so re-solving it inside the
+        # matched-cost bisection does not trigger a recompile.
+        def stack(p, h, lo, hi):
+            for i in range(lo, hi):
+                h = self.layer(p, i, h)
+            return h
+
+        self._jit["pre"] = jax.jit(
+            lambda p, t: stack(p, self.embed(p, t), 0, self.block))
+        self._jit["post"] = jax.jit(
+            lambda p, h: self.head(p, stack(p, h, self.block, self.n_layers)))
+        self._jit["post_edit"] = jax.jit(
+            lambda p, h, M, al: self.head(
+                p, stack(p, apply_edit(h, M, al), self.block, self.n_layers)))
+
+    def set_block(self, block: int) -> None:
+        """Move the site and rebuild the compiled halves.
+
+        The split point is baked into the traced graphs, so assigning `.block`
+        alone would leave the old compilation in place and silently keep
+        measuring the old site.
+        """
+        if not 0 <= block < self.n_layers:
+            raise ValueError(f"site {block} is outside a {self.n_layers}-layer stack")
+        self.block = block
+        self.__post_init__()
 
     def residual_at_site(self, tokens: jnp.ndarray) -> jnp.ndarray:
-        h = self.embed(self.params, tokens)
-        for i in range(self.block):
-            h = self.layer(self.params, i, h)
-        return h
+        return self._jit["pre"](self.params, tokens)
 
     def from_site(self, h: jnp.ndarray, M=None, alpha: float = 0.0) -> jnp.ndarray:
-        h = apply_edit(h, M, alpha)
-        for i in range(self.block, self.n_layers):
-            h = self.layer(self.params, i, h)
-        return self.head(self.params, h)
+        if M is None:
+            return self._jit["post"](self.params, h)
+        return self._jit["post_edit"](self.params, h, M, jnp.asarray(alpha, jnp.float32))
 
     def logits(self, tokens: jnp.ndarray, M=None, alpha: float = 0.0) -> jnp.ndarray:
         return self.from_site(self.residual_at_site(tokens), M, alpha)

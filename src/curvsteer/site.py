@@ -22,7 +22,10 @@ def apply_edit(h: jnp.ndarray, M: jnp.ndarray | None, alpha: float) -> jnp.ndarr
     an unconditional bias edit is what an activation steering vector is, and it
     is the restricted case the rank-r framing generalises.
     """
-    if M is None or alpha == 0.0:
+    # Branch on structure only. Inside the compiled forward `alpha` is a traced
+    # value, so testing it against zero would raise rather than short-circuit,
+    # and alpha = 0 already leaves h unchanged.
+    if M is None:
         return h
     if M.ndim == 1:
         return h + alpha * M                    # rank 0: unconditional

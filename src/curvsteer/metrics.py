@@ -33,14 +33,26 @@ class Metrics:
         self.model, self.tk = model, tokenizer
         self.prompt, self.cont_len = prompt, cont_len
         self.plen = len(tokenizer.encode(prompt))
+        # One shape for every behaviour batch. A word of review text can be
+        # several tokens, so the ceiling is generous rather than exact; `keep`
+        # makes the slack free.
+        self.width = self.plen + 2 * cont_len + 8
 
-    def encode(self, texts: list[str]):
+    def encode(self, texts: list[str], width: int | None = None):
+        """Pad to a **fixed** width, not the batch maximum.
+
+        A batch-dependent width gives every batch a new shape, and each new
+        shape recompiles the whole 48-layer forward. `keep` already excludes
+        padding from the score, so the extra columns cost arithmetic and change
+        no number.
+        """
         seqs = [self.tk.encode(self.prompt + " ".join(t.split()[:self.cont_len]))
                 for t in texts]
-        n = max(len(s) for s in seqs)
+        n = width or self.width
         ids = np.zeros((len(seqs), n), dtype=np.int32)
         keep = np.zeros((len(seqs), n), dtype=np.float32)
         for i, s in enumerate(seqs):
+            s = s[:n]
             ids[i, :len(s)] = s
             keep[i, self.plen:len(s)] = 1.0    # score the continuation only
         return jnp.asarray(ids), jnp.asarray(keep)

@@ -29,19 +29,19 @@ def main() -> int:
     a = ap.parse_args()
 
     import jax.numpy as jnp
-    from tokenizers import Tokenizer
 
     from curvsteer.config import CONFIGS
     from curvsteer.data import wikitext_chunks
     from curvsteer.metrics import token_nll
     from curvsteer.model import load
+    from curvsteer.tokenizer import load_tokenizer
 
     cfg = CONFIGS[a.config]
     print(f"gate: {cfg.model}, site {cfg.block}, expecting CE {a.expect:.4f}",
           flush=True)
 
     t0 = time.time()
-    tk = _tokenizer(cfg.model)
+    tk = load_tokenizer(cfg.model)
     model = load(cfg.model, cfg.block, cfg.dtype)
     print(f"  loaded in {time.time() - t0:.0f}s, d_model={model.d_model}, "
           f"{model.n_layers} layers", flush=True)
@@ -77,42 +77,6 @@ def main() -> int:
     print("  PASS" if ok else f"  FAIL: gap {gap:.4f} exceeds tol {a.tol}",
           flush=True)
     return 0 if ok else 1
-
-
-def _tokenizer(model_name: str):
-    """The Rust tokenizer, read straight from the checkpoint.
-
-    Deliberately not `transformers.AutoTokenizer`: this package is JAX-only and
-    should not pull a torch-first library in to split strings. `tokenizers`
-    applies the checkpoint's own post-processor, so the BOS handling is the
-    checkpoint's rather than something reimplemented here.
-    """
-    from huggingface_hub import hf_hub_download
-    from tokenizers import Tokenizer
-
-    tok = Tokenizer.from_file(hf_hub_download(model_name, "tokenizer.json"))
-
-    class _T:
-        bos_token_id = None
-
-        def encode(self, s: str):
-            return tok.encode(s).ids
-
-        def decode(self, ids):
-            return tok.decode(list(ids))
-
-    t = _T()
-    # Always expose BOS. The post-processor prepends one to a whole encoded
-    # string, but the capability corpus is chunked *after* encoding, so all but
-    # the first chunk would start mid-document with no BOS. Gemma scores an
-    # unprefixed chunk far worse than it deserves, which is a 1.2 nat error here
-    # and reads as a broken forward rather than a corpus bug.
-    t.bos_token_id = tok.token_to_id("<bos>")
-    probe = t.encode("hello")
-    print(f"  tokenizer: bos={t.bos_token_id}, "
-          f"whole-string encode prepends it={probe[:1] == [t.bos_token_id]}",
-          flush=True)
-    return t
 
 
 def _greedy(model, tk, prompt: str, n: int) -> str:
