@@ -5,65 +5,76 @@ negative ones. Capability is mean token cross-entropy on held-out raw text.
 
 Both are raw-text NLL, which is a base-model task. An instruct checkpoint scored
 this way can land worse than uniform over its own vocabulary while answering
-correctly through its chat template; `max_base_ce` in the sweep exists to refuse
-that case rather than produce a table of deltas from nonsense.
+correctly through its chat template, which is why the sweep refuses a reference
+above `--max-base-ce` rather than reporting deltas from nonsense.
 """
 from __future__ import annotations
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
+
+
+def token_nll(logits: jnp.ndarray, ids: jnp.ndarray, keep: jnp.ndarray) -> jnp.ndarray:
+    """Per-example mean NLL over the kept positions.
+
+    `keep` carries both the padding mask and the prompt exclusion, so rows never
+    interact and the prompt is never scored.
+    """
+    lp = jax.nn.log_softmax(logits[:, :-1].astype(jnp.float32), -1)
+    tok = -jnp.take_along_axis(lp, ids[:, 1:, None], axis=-1)[..., 0]
+    k = keep[:, 1:]
+    return (tok * k).sum(1) / jnp.clip(k.sum(1), 1, None)
 
 
 class Metrics:
     def __init__(self, model, tokenizer, prompt: str = "Review: ",
-                 cont_len: int = 48, device: str = "cuda"):
-        self.model, self.tk, self.device = model, tokenizer, device
+                 cont_len: int = 48):
+        self.model, self.tk = model, tokenizer
         self.prompt, self.cont_len = prompt, cont_len
-        self.plen = len(tokenizer(prompt)["input_ids"])
+        self.plen = len(tokenizer.encode(prompt))
 
     def encode(self, texts: list[str]):
-        s = [self.prompt + " ".join(t.split()[:self.cont_len]) for t in texts]
-        b = self.tk(s, return_tensors="pt", padding=True, truncation=True,
-                    max_length=self.plen + self.cont_len + 8)
-        return b["input_ids"].to(self.device), b["attention_mask"].to(self.device)
+        seqs = [self.tk.encode(self.prompt + " ".join(t.split()[:self.cont_len]))
+                for t in texts]
+        n = max(len(s) for s in seqs)
+        ids = np.zeros((len(seqs), n), dtype=np.int32)
+        keep = np.zeros((len(seqs), n), dtype=np.float32)
+        for i, s in enumerate(seqs):
+            ids[i, :len(s)] = s
+            keep[i, self.plen:len(s)] = 1.0    # score the continuation only
+        return jnp.asarray(ids), jnp.asarray(keep)
 
-    def nll_per(self, ids, mask):
-        """Per-example mean NLL over the continuation only.
+    def nll(self, texts, M=None, alpha: float = 0.0) -> jnp.ndarray:
+        ids, keep = self.encode(texts)
+        return token_nll(self.model.logits(ids, M, alpha), ids, keep)
 
-        Padding is on the right and the mask carries it, so rows do not interact.
-        """
-        logits = self.model(ids, attention_mask=mask).logits[:, :-1].float()
-        lp = torch.log_softmax(logits, -1)
-        tokl = -lp.gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-        keep = mask[:, 1:].clone()
-        keep[:, :self.plen - 1] = 0
-        return (tokl * keep).sum(1) / keep.sum(1).clamp(min=1)
+    def behaviour_from_site(self, h_pos, h_neg, ids_p, keep_p, ids_n, keep_n,
+                            M=None, alpha: float = 0.0) -> jnp.ndarray:
+        """`L_b` computed from cached residuals, so a gradient with respect to
+        the residual is a gradient of exactly the reported quantity."""
+        p = token_nll(self.model.from_site(h_pos, M, alpha), ids_p, keep_p)
+        n = token_nll(self.model.from_site(h_neg, M, alpha), ids_n, keep_n)
+        return (p - n).mean()
 
-    def nll(self, ids, mask):
-        return self.nll_per(ids, mask).mean()
+    def capability(self, chunks, M=None, alpha: float = 0.0, bs: int = 8) -> float:
+        tot = cnt = 0.0
+        for i in range(0, chunks.shape[0], bs):
+            b = chunks[i:i + bs]
+            keep = jnp.ones(b.shape, jnp.float32)
+            v = token_nll(self.model.logits(b, M, alpha), b, keep)
+            tot += float(v.sum())
+            cnt += b.shape[0]
+        return tot / cnt
 
-    def capability(self, data, bs: int = 16) -> float:
-        t = n = 0.0
-        with torch.no_grad():
-            for i in range(0, data.shape[0], bs):
-                b = data[i:i + bs]
-                t += self.model(b, labels=b).loss.item() * b.shape[0]
-                n += b.shape[0]
-        return t / n
-
-    def behaviour_per(self, pos, neg, idx, bs: int = 16) -> np.ndarray:
-        """Per-example behaviour, batched.
-
-        At 12B the one-at-a-time loop is hundreds of forwards per swept point and
-        dominates the run. Positive and negative are encoded separately so each
-        group's padding is independent of the other. `sweep --verify-batch`
-        checks this against the one-at-a-time path.
-        """
+    def behaviour_per(self, pos, neg, idx, M=None, alpha: float = 0.0,
+                      bs: int = 8) -> np.ndarray:
+        """Per-example behaviour, batched. Positive and negative are encoded
+        separately so each group's padding is independent of the other."""
         out = []
-        with torch.no_grad():
-            for i in range(0, len(idx), bs):
-                ch = idx[i:i + bs]
-                p = self.nll_per(*self.encode([pos[j] for j in ch]))
-                n = self.nll_per(*self.encode([neg[j] for j in ch]))
-                out.append((p - n).float().cpu().numpy())
+        for i in range(0, len(idx), bs):
+            ch = idx[i:i + bs]
+            p = self.nll([pos[j] for j in ch], M, alpha)
+            n = self.nll([neg[j] for j in ch], M, alpha)
+            out.append(np.asarray(p - n))
         return np.concatenate(out) if out else np.zeros(0)

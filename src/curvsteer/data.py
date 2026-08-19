@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import hashlib
 
+import jax.numpy as jnp
 import numpy as np
-import torch
 
 
 def fit_split(text: str) -> bool:
@@ -29,9 +29,10 @@ def imdb_pairs(n_pairs: int, seed: int = 0):
     return pos, neg, np.where(is_fit)[0], np.where(~is_fit)[0]
 
 
-def wikitext_chunks(tokenizer, n_cap: int, device: str, chunk: int = 127):
-    """Two disjoint halves: A and G are estimated on the first, capability scored
-    on the second, so the curvature estimate never sees the text it is judged on.
+def wikitext_chunks(tokenizer, n_cap: int, chunk: int = 127):
+    """Two disjoint halves: A and G are estimated on the first, capability is
+    scored on the second, so the curvature estimate never sees the text it is
+    judged on.
 
     A BOS token is prepended where the tokenizer has one. Gemma scores an
     unprefixed chunk far worse than it deserves; on one checkpoint this alone
@@ -40,8 +41,8 @@ def wikitext_chunks(tokenizer, n_cap: int, device: str, chunk: int = 127):
     from datasets import load_dataset
     wt = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
     txt = "\n\n".join(t for t in wt["text"] if t.strip())
-    ids = torch.tensor(tokenizer(txt)["input_ids"])[:2 * n_cap * chunk].view(-1, chunk)
-    if tokenizer.bos_token_id is not None:
-        bos = torch.full((ids.shape[0], 1), tokenizer.bos_token_id, dtype=ids.dtype)
-        ids = torch.cat([bos, ids], 1)
-    return ids[:n_cap].to(device), ids[n_cap:2 * n_cap].to(device)
+    ids = np.asarray(tokenizer.encode(txt)[:2 * n_cap * chunk]).reshape(-1, chunk)
+    bos = getattr(tokenizer, "bos_id", None) or getattr(tokenizer, "bos_token_id", None)
+    if bos is not None:
+        ids = np.concatenate([np.full((ids.shape[0], 1), bos, ids.dtype), ids], 1)
+    return jnp.asarray(ids[:n_cap]), jnp.asarray(ids[n_cap:2 * n_cap])

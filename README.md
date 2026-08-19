@@ -2,12 +2,14 @@
 
 <p align="center">
   <b>Steering is a curvature problem, not a direction problem.</b><br>
-  Rank-<i>r</i> <b>parameter-space</b> edits, curvature-normalised, with no dictionary.
+  Rank-<i>r</i> <b>parameter-space</b> edits, curvature-normalised, with no dictionary.<br>
+  <b>JAX end to end.</b>
 </p>
 
 <p align="center">
   <img alt="tests" src="https://github.com/seonglae/curvsteer/actions/workflows/ci.yml/badge.svg">
   <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-3776ab">
+  <img alt="jax" src="https://img.shields.io/badge/JAX-only-b45309">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-a93a20">
 </p>
 
@@ -145,15 +147,20 @@ measurement, and the command says so when it runs.
 
 ```bash
 pip install -e ".[sweep]"
-curvsteer sweep --config gemma4 --device cuda --n-pairs 256 --n-cap 96
+curvsteer sweep --config gemma4 --n-pairs 256 --n-cap 96
 ```
+
+The model is loaded through the official JAX Gemma library where it covers the
+checkpoint, and otherwise by reading the published weights and running a forward
+written in `model.py`. The fallback is not a workaround: a method that needs no
+dictionary should not be blocked by whether someone has shipped a wrapper for the
+checkpoint, which is the same argument the dictionary section below makes.
 
 | claim | command |
 |---|---|
 | the demo separation, closed form | `curvsteer demo` |
 | the headline table, no dictionary exists here | `curvsteer sweep --config gemma4` |
 | the dictionary comparison, where one does exist | `curvsteer sweep --config gemma2` |
-| the batched behaviour path is exact | `curvsteer sweep --config gpt2 --verify-batch` |
 | which site, rather than an inherited one | `curvsteer layer-scan --config gemma4` |
 
 ## Design notes
@@ -161,12 +168,20 @@ curvsteer sweep --config gemma4 --device cuda --n-pairs 256 --n-cap 96
 For a reader judging the code rather than the result, these are the places where
 something could have gone silently wrong, and what was done about it.
 
-**One hook does capture and intervention.** `site.py` accumulates `A`, `G`,
-`mean_g` and applies the edit through the same forward pre-hook, so the statistics
-and the intervention cannot end up on different tensors. Every parameter is frozen
-and the input is token ids, so the residual carries no `grad_fn` and cannot be
-hooked; a zero leaf that does require grad creates the edge without changing any
-value.
+**There is no hook, and that is the point.** The residual at the site is an
+ordinary intermediate value: `model.residual_at_site(tokens)` returns it and
+`model.from_site(h, M, alpha)` continues the stack from it. `delta = dL/dh` is
+then one `jax.grad` with respect to that value, and the same `h` object feeds
+both the statistics and the intervention, so they cannot end up on different
+tensors.
+
+This is worth stating because the framework choice removed a bug class rather
+than moving it. In a define-by-run framework the same experiment needs a forward
+hook, and on a frozen model whose input is token ids the residual carries no
+autodiff edge at all, so capturing it means adding a zero leaf that requires grad
+purely to manufacture the edge. Splitting the forward at the site makes that
+unnecessary. The one real cost is that the model's layer stack has to be
+addressable rather than opaque, which is what `model.py` provides.
 
 **Cost is measured, never predicted.** `solve.py` solves `alpha` against the true
 cross-entropy. A direction that damages the model in a way the curvature estimate

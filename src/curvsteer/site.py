@@ -1,101 +1,76 @@
-"""The residual-stream site: captures the Kronecker factors, applies the edit.
+"""The residual-stream site: the intervention, and the Kronecker factors.
 
-One hook does both jobs so the statistics and the intervention cannot drift onto
-different tensors.
+There is no hook here, and that is the point. In a framework where a frozen
+model's residual carries no autodiff edge, capturing it means attaching a hook
+and manufacturing an edge that does not otherwise exist. Here the residual is an
+argument to a function, so the intervention is threaded through the forward and
+`jax.grad` gives `delta = dL/dh` directly. An entire class of hook-ordering and
+tensor-aliasing bug does not arise.
 """
 from __future__ import annotations
 
-import torch
+from dataclasses import dataclass
+
+import jax
+import jax.numpy as jnp
 
 
-def get_blocks(model, attr: str):
-    obj = model
-    for part in attr.split("."):
-        obj = getattr(obj, part)
-    return obj
+def apply_edit(h: jnp.ndarray, M: jnp.ndarray | None, alpha: float) -> jnp.ndarray:
+    """`h -> h + alpha * (M h)`, or the rank-0 bias edit when `M` is a vector.
 
-
-def hidden_size(cfg_obj) -> int:
-    for name in ("hidden_size", "n_embd", "d_model"):
-        if getattr(cfg_obj, name, None):
-            return int(getattr(cfg_obj, name))
-    inner = getattr(cfg_obj, "text_config", None)
-    if inner is not None:
-        return hidden_size(inner)
-    raise AttributeError("cannot find hidden size on this config")
-
-
-class Site:
-    """Captures `h` and its gradient at one block, and applies the rank-r edit.
-
-    Accumulates, in one pass each:
-      A       = E[h h^T]              from capability text
-      G       = E[delta delta^T]      from capability text
-      mean_g  = E[delta h^T]          from behaviour pairs
-      mean_dg = E[delta]              the rank-0 behaviour gradient
+    Dispatch is on dimensionality, and rank 0 is a genuinely different object:
+    an unconditional bias edit is what an activation steering vector is, and it
+    is the restricted case the rank-r framing generalises.
     """
+    if M is None or alpha == 0.0:
+        return h
+    if M.ndim == 1:
+        return h + alpha * M                    # rank 0: unconditional
+    return h + alpha * (h @ M.T)                # rank r: conditional on h
 
-    def __init__(self, blocks, block: int, d_model: int, device, dtype):
-        self.M = None
-        self.scale = 0.0
-        self.capture = False
-        # Every parameter is frozen and the input is token ids, so the residual
-        # carries no grad_fn and cannot be hooked. Adding a zero leaf that does
-        # require grad creates the edge without changing any value.
-        self.zero = torch.zeros(d_model, device=device, dtype=dtype,
-                                requires_grad=True)
-        self.h_sum = self.d_sum = self.g_sum = self.gv_sum = None
-        self.n_tok = 0
-        # with_kwargs: a decoder layer may receive hidden_states positionally or
-        # by keyword depending on the transformers release, and a positional-only
-        # hook sees an empty tuple in the second case.
-        blocks[block].register_forward_pre_hook(self._hook, with_kwargs=True)
 
-    def _hook(self, mod, inp, kw):
-        if inp:
-            h = inp[0]
-        elif "hidden_states" in kw:
-            h = kw["hidden_states"]
-        else:
-            raise RuntimeError("hook cannot find hidden_states at the site")
-        if self.M is None:
-            out = h
-        elif self.M.dim() == 1:
-            out = h + self.scale * self.M            # rank 0: unconditional bias
-        else:
-            out = h + self.scale * (h @ self.M.T)    # rank r: conditional
-        if self.capture:
-            flat = h.detach().reshape(-1, h.shape[-1]).float()
-            self.h_sum = flat.T @ flat if self.h_sum is None else self.h_sum + flat.T @ flat
-            self.n_tok += flat.shape[0]
-            # Bind this call's h into the hook. A behaviour example runs two
-            # forwards (positive and negative) before either backward, so a
-            # single attribute would be overwritten and the shapes would not
-            # match the gradient that eventually arrives.
-            h_det = h.detach()
-            out = out + self.zero
-            out.register_hook(lambda grad, hd=h_det: self._grab(grad, hd))
-        if inp:
-            return (out,) + inp[1:], kw
-        kw = dict(kw)
-        kw["hidden_states"] = out
-        return inp, kw
+@dataclass
+class Factors:
+    """The three quantities every arm is built from.
 
-    def _grab(self, grad, h_det):
-        g = grad.detach().reshape(-1, grad.shape[-1]).float()
-        hh = h_det.reshape(-1, grad.shape[-1]).float()
+        A       = E[h h^T]            over capability tokens
+        G       = E[delta delta^T]    over capability tokens
+        mean_g  = E[delta h^T]        over behaviour pairs
+        mean_dg = E[delta]            the rank-0 behaviour gradient
+
+    Accumulated as sums and normalised once, so a partial run is resumable and
+    the divisor is written down in one place instead of at every call site.
+    """
+    h_sum: jnp.ndarray | None = None
+    d_sum: jnp.ndarray | None = None
+    g_sum: jnp.ndarray | None = None
+    gv_sum: jnp.ndarray | None = None
+    n_tok: int = 0
+    n_ex: int = 0
+
+    def add_capability(self, h: jnp.ndarray, delta: jnp.ndarray) -> None:
+        flat = h.reshape(-1, h.shape[-1]).astype(jnp.float32)
+        g = delta.reshape(-1, delta.shape[-1]).astype(jnp.float32)
+        self.h_sum = flat.T @ flat if self.h_sum is None else self.h_sum + flat.T @ flat
         self.d_sum = g.T @ g if self.d_sum is None else self.d_sum + g.T @ g
-        self.g_sum = g.T @ hh if self.g_sum is None else self.g_sum + g.T @ hh
+        self.n_tok += flat.shape[0]
+
+    def add_behaviour(self, h: jnp.ndarray, delta: jnp.ndarray) -> None:
+        flat = h.reshape(-1, h.shape[-1]).astype(jnp.float32)
+        g = delta.reshape(-1, delta.shape[-1]).astype(jnp.float32)
+        self.g_sum = g.T @ flat if self.g_sum is None else self.g_sum + g.T @ flat
         gv = g.sum(0)
         self.gv_sum = gv if self.gv_sum is None else self.gv_sum + gv
-        return grad
+        self.n_ex += 1
 
-    def reset(self):
-        self.h_sum = self.d_sum = self.g_sum = self.gv_sum = None
-        self.n_tok = 0
+    def finish(self):
+        import numpy as np
+        return (np.asarray(self.g_sum) / max(self.n_ex, 1),
+                np.asarray(self.h_sum) / max(self.n_tok, 1),
+                np.asarray(self.d_sum) / max(self.n_tok, 1),
+                np.asarray(self.gv_sum) / max(self.n_ex, 1))
 
-    def set(self, M, s):
-        self.M, self.scale = M, s
 
-    def clear(self):
-        self.M, self.scale = None, 0.0
+def residual_grad(loss_fn, h: jnp.ndarray):
+    """`(loss, dL/dh)` at the site. This is the whole capture mechanism."""
+    return jax.value_and_grad(loss_fn)(h)

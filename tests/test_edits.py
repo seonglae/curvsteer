@@ -35,3 +35,22 @@ def test_m_star_reduces_to_the_gradient_under_isotropy():
     g = np.random.default_rng(2).standard_normal((d, d))
     M = m_star(g, np.eye(d), np.eye(d))
     assert np.allclose(frob1(M), frob1(g), atol=1e-6)
+
+
+def test_jax_and_numpy_paths_agree():
+    """One method, two call sites. If these drift, a sweep and a differentiable
+    pipeline would silently optimise different objects."""
+    import jax.numpy as jnp
+
+    from curvsteer.edits import m_star_jax
+
+    rng = np.random.default_rng(5)
+    d = 12
+    g = rng.standard_normal((d, d))
+    A = np.eye(d) + 0.1 * rng.standard_normal((d, d))
+    A = A @ A.T
+    G = np.eye(d) + 0.1 * rng.standard_normal((d, d))
+    G = G @ G.T
+    a = m_star(g, A, G)
+    b = np.asarray(m_star_jax(jnp.asarray(g), jnp.asarray(A), jnp.asarray(G)))
+    assert np.allclose(a, b, atol=1e-4)

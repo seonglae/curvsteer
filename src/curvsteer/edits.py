@@ -11,6 +11,7 @@ so rank is a free parameter the activation framing does not expose.
 """
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 
 #: Ridge on A and G before inversion, relative to each matrix's mean eigenvalue.
@@ -49,6 +50,20 @@ def bias_edit(v: np.ndarray) -> np.ndarray:
 def _ridge(X: np.ndarray) -> np.ndarray:
     d = X.shape[0]
     return X + LAMBDA_REL * np.trace(X) / d * np.eye(d)
+
+
+def m_star_jax(mean_g, A, G):
+    """`M*` under JAX, for use inside a jitted or gradient-taking context.
+
+    Kept beside the NumPy path rather than replacing it because the sweep solves
+    `M*` once on host and then sweeps, while a differentiable pipeline needs it
+    as a traceable function. Both call the same two ridged solves, and
+    `tests/test_edits.py` pins them to each other.
+    """
+    d = A.shape[0]
+    Ar = A + LAMBDA_REL * jnp.trace(A) / d * jnp.eye(d)
+    Gr = G + LAMBDA_REL * jnp.trace(G) / d * jnp.eye(d)
+    return jnp.linalg.solve(Gr, mean_g) @ jnp.linalg.inv(Ar)
 
 
 def m_star(mean_g: np.ndarray, A: np.ndarray, G: np.ndarray) -> np.ndarray:

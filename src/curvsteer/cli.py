@@ -1,7 +1,7 @@
 """curvsteer command line.
 
     curvsteer demo                     no model, no data, about a second
-    curvsteer sweep --config gemma4    the measured result, needs a GPU
+    curvsteer sweep --config gemma4    the measured result, needs an accelerator
     curvsteer layer-scan --config ...  which site, in one backward pass
 """
 from __future__ import annotations
@@ -19,7 +19,6 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("sweep", help="matched-cost sweep on a real model")
     s.add_argument("--config", default="gpt2")
-    s.add_argument("--device", default="cuda")
     s.add_argument("--n-pairs", type=int, default=256)
     s.add_argument("--n-cap", type=int, default=96)
     s.add_argument("--cont-len", type=int, default=48)
@@ -29,13 +28,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--max-base-ce", type=float, default=6.0,
                    help="refuse to sweep if the unsteered model cannot model the "
                         "capability corpus at all")
-    s.add_argument("--verify-batch", action="store_true",
-                   help="check the batched behaviour path against one-at-a-time "
-                        "and exit")
 
     l = sub.add_parser("layer-scan", help="post-hoc diagnostic over every block")
     l.add_argument("--config", default="gpt2")
-    l.add_argument("--device", default="cuda")
     l.add_argument("--out-dir", default="results")
 
     a = ap.parse_args(argv)

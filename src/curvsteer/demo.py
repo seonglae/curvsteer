@@ -8,6 +8,7 @@ be separated exactly rather than measured. The measured result on
 """
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 
 from .edits import curvature_only, m_star, rank_trunc, random_rank1
