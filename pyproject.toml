@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "curvsteer"
+version = "0.1.0"
+description = "Curvature-normalised rank-r parameter-space steering of language models, without a dictionary"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Seonglae Cho"}]
+keywords = ["interpretability", "steering", "parameter-space", "curvature", "kfac", "mechanistic-interpretability"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# The demo and the tests need nothing but numpy. Reproducing the measured
+# result needs a model, so those dependencies are separate on purpose.
+sweep = ["torch>=2.2", "transformers>=4.44", "datasets>=2.18", "huggingface-hub>=0.23"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+curvsteer = "curvsteer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

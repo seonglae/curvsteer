@@ -1,0 +1,11 @@
+_internal/
+.venv/
+__pycache__/
+*.npz
+*.pt
+results/
+out/
+.DS_Store
+*.egg-info/
+build/
+dist/
