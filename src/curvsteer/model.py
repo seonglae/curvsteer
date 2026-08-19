@@ -1,29 +1,49 @@
-"""Loading a Gemma checkpoint in JAX, and running a forward that can be edited
+"""Loading a Gemma checkpoint in JAX and running a forward that can be edited
 mid-stack.
 
-Two loaders, tried in order. The first is the official JAX library; the second
-reads the published weights and runs a forward written here. The fallback exists
-because a dependency-free method should not be blocked by whether someone has
-shipped a wrapper for the checkpoint, which is the same argument the dictionary
-section of the README makes.
+The published weights are safetensors, which `safetensors.numpy` reads straight
+to arrays, so the forward below is written here rather than delegated. That is
+not a fallback: the official JAX library reads orbax checkpoints and this
+checkpoint has no orbax form, so a direct read is the only path that exists.
+It also keeps the promise the README makes, since the intervention is threaded
+through a forward whose every step is visible instead of into someone's wrapper.
+
+The Gemma 4 text tower is not a generic decoder and the differences are not
+cosmetic. Each is written down at the point it is implemented, because every one
+of them runs fine when wrong and silently reproduces nothing.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .site import apply_edit
+
+
+@dataclass
+class LayerSpec:
+    """Per-layer geometry. Gemma 4 alternates two attention types that differ in
+    head width, KV count, rope base and whether a value projection exists."""
+    kind: str
+    head_dim: int
+    n_kv: int
+    theta: float
+    partial: float | None
+    window: int | None
+    k_eq_v: bool
 
 
 @dataclass
 class Loaded:
     """A model reduced to what the experiment needs.
 
-    `run(tokens, M, alpha, upto)` returns logits with the edit applied at the
-    site, and `split_at(tokens)` returns the residual there so a gradient can be
-    taken with respect to it.
+    `residual_at_site` returns the residual at the site so a gradient can be
+    taken with respect to it, and `from_site` resumes the stack with the edit
+    applied. Splitting the forward this way is what makes `jax.grad` give
+    `delta = dL/dh` without a hook.
     """
     params: dict
     d_model: int
@@ -33,6 +53,7 @@ class Loaded:
     layer: callable
     head: callable
     name: str = ""
+    specs: list = field(default_factory=list)
 
     def residual_at_site(self, tokens: jnp.ndarray) -> jnp.ndarray:
         h = self.embed(self.params, tokens)
@@ -51,122 +72,192 @@ class Loaded:
 
 
 def load(model_name: str, block: int, dtype: str = "bfloat16") -> Loaded:
-    """Load `model_name` and assert the shape the config claims.
+    return _load_direct(model_name, block, dtype)
 
-    The assertion is not defensive noise. The experiment's site is an index into
-    a specific stack, and a checkpoint whose depth or width differs from the
-    recorded one is a different experiment wearing the same config name.
+
+def _inv_freq(head_dim: int, theta: float, partial: float | None) -> np.ndarray:
+    """Rope inverse frequencies.
+
+    The `proportional` variant rotates only the first `partial` fraction of the
+    head and pads the rest with **zero** frequencies, so those channels get
+    `cos = 1, sin = 0` and pass through unrotated. Truncating the head instead
+    would change its width and is the obvious wrong reading.
     """
-    try:
-        return _load_gemma_lib(model_name, block, dtype)
-    except (ImportError, KeyError, ValueError) as e:
-        print(f"  gemma library path unavailable ({type(e).__name__}: {e}); "
-              f"falling back to a direct weight read", flush=True)
-        return _load_direct(model_name, block, dtype)
+    if partial is None:
+        return 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+    rope_angles = int(partial * head_dim // 2)
+    rot = 1.0 / (theta ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float64) / head_dim))
+    nope = head_dim // 2 - rope_angles
+    return np.concatenate([rot, np.zeros(nope, dtype=np.float64)]) if nope > 0 else rot
 
 
-def _load_gemma_lib(model_name: str, block: int, dtype: str) -> Loaded:
-    from gemma import gm  # google-deepmind/gemma, JAX
-
-    variant = model_name.split("/")[-1]
-    model = gm.nn.from_name(variant)
-    params = gm.ckpts.load_params(variant)
-    cfg = model.config
-    d_model = int(getattr(cfg, "embed_dim", getattr(cfg, "hidden_size", 0)))
-    n_layers = int(getattr(cfg, "num_layers", getattr(cfg, "num_hidden_layers", 0)))
-    if not d_model or not n_layers:
-        raise ValueError("cannot read width and depth off this config")
-    if not 0 <= block < n_layers:
-        raise ValueError(f"site {block} is outside a {n_layers}-layer stack")
-
-    def embed(p, tokens):
-        return model.apply(p, tokens, method=model.embed_tokens)
-
-    def layer(p, i, h):
-        return model.apply(p, h, layer_index=i, method=model.run_layer)
-
-    def head(p, h):
-        return model.apply(p, h, method=model.decode_head)
-
-    return Loaded(params, d_model, n_layers, block, embed, layer, head, model_name)
+def _rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
+    """`(x * cos) + (rotate_half(x) * sin)`; x is (B, T, H, D), cos/sin are (T, D)."""
+    d = x.shape[-1] // 2
+    half = jnp.concatenate([-x[..., d:], x[..., :d]], axis=-1)
+    return x * cos[None, :, None, :] + half * sin[None, :, None, :]
 
 
 def _load_direct(model_name: str, block: int, dtype: str) -> Loaded:
-    """Read the published safetensors and run a Gemma forward written here.
-
-    Deliberately explicit rather than fused: on a decoder this costs little and
-    it removes any question about what the intervention is being applied to.
-    """
-    import numpy as np
-    from huggingface_hub import snapshot_download
-    from safetensors.numpy import load_file
     import glob
     import json
     import os
 
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
     path = snapshot_download(model_name, allow_patterns=["*.safetensors", "*.json"])
-    cfg = json.load(open(os.path.join(path, "config.json")))
-    cfg = cfg.get("text_config", cfg)
+    raw = json.load(open(os.path.join(path, "config.json")))
+    cfg = raw.get("text_config", raw)
+
     d_model = int(cfg["hidden_size"])
     n_layers = int(cfg["num_hidden_layers"])
     n_heads = int(cfg["num_attention_heads"])
-    n_kv = int(cfg.get("num_key_value_heads", n_heads))
-    head_dim = int(cfg.get("head_dim", d_model // n_heads))
-    rope_base = float(cfg.get("rope_theta", 10000.0))
-    eps = float(cfg.get("rms_norm_eps", 1e-6))
+    eps = float(cfg["rms_norm_eps"])
+    softcap = cfg.get("final_logit_softcapping")
+    window = int(cfg.get("sliding_window", 0)) or None
+    layer_types = list(cfg["layer_types"])
+    rope_params = cfg["rope_parameters"]
+    k_eq_v_cfg = bool(cfg.get("attention_k_eq_v", False))
+
+    # Two hard paths in the reference implementation are dead for this
+    # checkpoint and are asserted rather than implemented, so a checkpoint that
+    # turns them on fails loudly instead of being silently mis-run.
+    if int(cfg.get("num_kv_shared_layers", 0)) != 0:
+        raise NotImplementedError("this checkpoint shares KV across layers")
+    if bool(cfg.get("use_double_wide_mlp", False)):
+        raise NotImplementedError("this checkpoint uses a double-wide MLP")
     if not 0 <= block < n_layers:
         raise ValueError(f"site {block} is outside a {n_layers}-layer stack")
 
-    w = {}
-    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        w.update(load_file(f))
+    def spec_for(kind: str) -> LayerSpec:
+        rp = rope_params[kind]
+        sliding = kind == "sliding_attention"
+        # head_dim and KV count differ per type; global_head_dim names the wide one.
+        hd = int(cfg["head_dim"]) if sliding else int(cfg["global_head_dim"])
+        nkv = (int(cfg["num_key_value_heads"]) if sliding
+               else int(cfg["num_global_key_value_heads"]))
+        return LayerSpec(
+            kind=kind, head_dim=hd, n_kv=nkv,
+            theta=float(rp["rope_theta"]),
+            partial=rp.get("partial_rotary_factor"),
+            window=window if sliding else None,
+            # `use_alternative_attention = attention_k_eq_v and not is_sliding`:
+            # only the full layers drop v_proj and reuse the keys as values.
+            k_eq_v=k_eq_v_cfg and not sliding,
+        )
+
+    specs = [spec_for(t) for t in layer_types]
+    kinds = {s.kind: s for s in specs}
+    inv_freq = {k: jnp.asarray(_inv_freq(s.head_dim, s.theta, s.partial), jnp.float32)
+                for k, s in kinds.items()}
+
     jd = getattr(jnp, dtype)
-    params = {k: jnp.asarray(v, dtype=jd) for k, v in w.items()}
+    params: dict[str, jnp.ndarray] = {}
+    n_skipped = 0
+    # Read one tensor at a time. Materialising the whole file as numpy before
+    # converting would hold the checkpoint twice at peak.
+    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        with safe_open(f, framework="numpy") as sf:
+            for k in sf.keys():
+                # Text tower only. The vision and audio towers are never reached
+                # by a token-only forward and are a large share of the file.
+                if (".vision" in k or ".audio" in k
+                        or "embed_vision" in k or "embed_audio" in k):
+                    n_skipped += 1
+                    continue
+                params[k] = jnp.asarray(sf.get_tensor(k), dtype=jd)
+    print(f"  loaded {len(params)} text tensors, skipped {n_skipped} vision/audio",
+          flush=True)
 
-    def rms(x, g):
+    P = "model.language_model"
+
+    def rms(x, w=None):
+        """`x * (mean(x^2) + eps)^-0.5`, then `* weight` when the norm is scaled.
+
+        Note `* weight`, not Gemma 2's `* (1 + weight)`: these weights are
+        initialised to ones, and the off-by-one runs fine and reproduces nothing.
+        """
         v = x.astype(jnp.float32)
-        n = v * jax.lax.rsqrt((v * v).mean(-1, keepdims=True) + eps)
-        return (n * (1.0 + g.astype(jnp.float32))).astype(x.dtype)
+        ms = jnp.mean(v * v, axis=-1, keepdims=True) + eps
+        n = v * (ms ** -0.5)
+        if w is not None:
+            n = n * w.astype(jnp.float32)
+        return n.astype(x.dtype)
 
-    def rope(x, pos):
-        half = head_dim // 2
-        inv = 1.0 / (rope_base ** (jnp.arange(half, dtype=jnp.float32) * 2 / head_dim))
-        ang = pos[:, None] * inv[None, :]
-        c, s = jnp.cos(ang), jnp.sin(ang)
-        x1, x2 = x[..., :half], x[..., half:]
-        return jnp.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], -1)
+    def attention(p, i, x, s: LayerSpec):
+        g = lambda n: p[f"{P}.layers.{i}.{n}"]
+        B, T, _ = x.shape
+        hd = s.head_dim
+        pos = jnp.arange(T, dtype=jnp.float32)
+        freqs = pos[:, None] * inv_freq[s.kind][None, :]
+        emb = jnp.concatenate([freqs, freqs], axis=-1)
+        cos, sin = jnp.cos(emb), jnp.sin(emb)
 
-    P = "model.layers"
+        q = (x @ g("self_attn.q_proj.weight").T).reshape(B, T, n_heads, hd)
+        q = _rope(rms(q, g("self_attn.q_norm.weight")), cos, sin)
+
+        k_raw = (x @ g("self_attn.k_proj.weight").T).reshape(B, T, s.n_kv, hd)
+        k = _rope(rms(k_raw, g("self_attn.k_norm.weight")), cos, sin)
+
+        # When v_proj is absent the values are the *raw* k_proj output, taken
+        # before k_norm and given no rope. Reusing the normed or roped keys here
+        # is the same shape and a different model.
+        v_in = k_raw if s.k_eq_v else (
+            x @ g("self_attn.v_proj.weight").T).reshape(B, T, s.n_kv, hd)
+        v = rms(v_in)          # v_norm has with_scale=False: no learned gain
+
+        if s.n_kv != n_heads:
+            rep = n_heads // s.n_kv
+            k = jnp.repeat(k, rep, axis=2)
+            v = jnp.repeat(v, rep, axis=2)
+
+        # scaling is 1.0. There is no 1/sqrt(head_dim) here; q_norm does that
+        # job, and dividing again gives a plausible-looking wrong model.
+        att = jnp.einsum("bqhd,bkhd->bhqk", q, k).astype(jnp.float32)
+        qi = jnp.arange(T)[:, None]
+        ki = jnp.arange(T)[None, :]
+        allowed = ki <= qi
+        if s.window:
+            allowed = allowed & (ki > qi - s.window)
+        att = jnp.where(allowed[None, None], att, -jnp.inf)
+        att = jax.nn.softmax(att, axis=-1).astype(x.dtype)
+        o = jnp.einsum("bhqk,bkhd->bqhd", att, v).reshape(B, T, n_heads * hd)
+        return o @ g("self_attn.o_proj.weight").T
 
     def layer(p, i, h):
-        g = lambda n: p[f"{P}.{i}.{n}"]
-        x = rms(h, g("input_layernorm.weight"))
-        T = x.shape[-2]
-        pos = jnp.arange(T, dtype=jnp.float32)
-        q = (x @ g("self_attn.q_proj.weight").T).reshape(*x.shape[:-1], n_heads, head_dim)
-        k = (x @ g("self_attn.k_proj.weight").T).reshape(*x.shape[:-1], n_kv, head_dim)
-        v = (x @ g("self_attn.v_proj.weight").T).reshape(*x.shape[:-1], n_kv, head_dim)
-        q, k = rope(q, pos), rope(k, pos)
-        if n_kv != n_heads:
-            rep = n_heads // n_kv
-            k = jnp.repeat(k, rep, axis=-2)
-            v = jnp.repeat(v, rep, axis=-2)
-        att = jnp.einsum("...qhd,...khd->...hqk", q, k) / jnp.sqrt(head_dim)
-        mask = jnp.tril(jnp.ones((T, T), bool))
-        att = jnp.where(mask, att, -jnp.inf)
-        att = jax.nn.softmax(att.astype(jnp.float32), -1).astype(x.dtype)
-        o = jnp.einsum("...hqk,...khd->...qhd", att, v).reshape(*x.shape[:-1], -1)
-        h = h + o @ g("self_attn.o_proj.weight").T
-        y = rms(h, g("post_attention_layernorm.weight"))
-        gate = jax.nn.gelu(y @ g("mlp.gate_proj.weight").T, approximate=True)
-        return h + (gate * (y @ g("mlp.up_proj.weight").T)) @ g("mlp.down_proj.weight").T
+        """Gemma-2 sandwich, plus a scalar on the whole layer output.
+
+        post_attention_layernorm normalises the *attention output* before the
+        residual add, not the stream before the MLP.
+        """
+        g = lambda n: p[f"{P}.layers.{i}.{n}"]
+        s = specs[i]
+        r = h
+        a = attention(p, i, rms(h, g("input_layernorm.weight")), s)
+        h = r + rms(a, g("post_attention_layernorm.weight"))
+
+        r = h
+        y = rms(h, g("pre_feedforward_layernorm.weight"))
+        act = jax.nn.gelu(y @ g("mlp.gate_proj.weight").T, approximate=True)
+        m = (act * (y @ g("mlp.up_proj.weight").T)) @ g("mlp.down_proj.weight").T
+        h = r + rms(m, g("post_feedforward_layernorm.weight"))
+
+        # Applied to the entire layer output, after both residual adds.
+        return h * g("layer_scalar").astype(h.dtype)
+
+    embed_scale = jnp.asarray(d_model ** 0.5, dtype=jd)
 
     def embed(p, tokens):
-        e = p["model.embed_tokens.weight"][tokens]
-        return e * jnp.asarray(d_model ** 0.5, dtype=e.dtype)
+        return p[f"{P}.embed_tokens.weight"][tokens] * embed_scale
 
     def head_fn(p, h):
-        h = rms(h, p["model.norm.weight"])
-        return h @ p["model.embed_tokens.weight"].T   # Gemma ties the embedding
+        h = rms(h, p[f"{P}.norm.weight"])
+        logits = (h @ p[f"{P}.embed_tokens.weight"].T).astype(jnp.float32)
+        if softcap:                       # tanh soft-cap, tied embedding head
+            c = float(softcap)
+            logits = jnp.tanh(logits / c) * c
+        return logits
 
-    return Loaded(params, d_model, n_layers, block, embed, layer, head_fn, model_name)
+    return Loaded(params, d_model, n_layers, block, embed, layer, head_fn,
+                  model_name, specs)
